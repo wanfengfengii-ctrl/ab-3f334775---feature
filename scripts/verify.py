@@ -51,6 +51,24 @@ CONFLICT_REQUEST = dict(
     anchors=[{"index": 0, "value": 10}, {"index": 15, "value": 40}],
 )
 
+# A sync-window request layered on top of the canonical 16-element case:
+# element 3 (delay 17) must be the unique 17 inside [2,4], and element 10
+# (delay 30) the unique 30 inside [9,11].  Windows are sorted by start.
+SYNC_REQUEST = dict(
+    TYPICAL_REQUEST,
+    sync_windows=[
+        {"start": 2, "end": 4, "value": 17},
+        {"start": 9, "end": 11, "value": 30},
+    ],
+)
+
+# Joint infeasibility: a singleton window directly contradicts the anchor at
+# index 8 (x[8] must be 26) while still being well-formed input.
+SYNC_CONFLICT_REQUEST = dict(
+    TYPICAL_REQUEST,
+    sync_windows=[{"start": 8, "end": 8, "value": 20}],
+)
+
 
 # ---------------------------------------------------------------------------
 # Check 1: code tests
@@ -181,6 +199,21 @@ def _validate_plan(body):
     assert plan["total_abs_error"] == sum(abs(e) for e in plan["errors"])
 
 
+def _validate_sync_plan(body):
+    plan = body["plan"]
+    x = plan["delays"]
+    picked = plan.get("sync_windows")
+    assert picked is not None and len(picked) == len(SYNC_REQUEST["sync_windows"])
+    for w, p in zip(SYNC_REQUEST["sync_windows"], picked):
+        assert set(p.keys()) == {"index", "value"}
+        assert w["start"] <= p["index"] <= w["end"], "hit inside its window"
+        assert p["value"] == w["value"]
+        assert x[p["index"]] == w["value"], "selected element equals value"
+        hits = sum(1 for i in range(w["start"], w["end"] + 1)
+                   if x[i] == w["value"])
+        assert hits == 1, f"window [{w['start']},{w['end']}] has {hits} hits"
+
+
 def check_api_smoke():
     print("== [3/3] API smoke ==")
     base_url = os.environ.get("API_BASE_URL")
@@ -213,6 +246,42 @@ def check_api_smoke():
         print(f"   typical compile: PASS "
               f"(E_max={plan['max_abs_error']}, E_sum={plan['total_abs_error']}, "
               f"ramps={plan['ramp_count']})")
+
+        status, body = _request("POST",
+                                f"{base_url}/api/delay-plans/compile",
+                                SYNC_REQUEST)
+        if status != 200:
+            print(f"   sync-window compile returned {status}: {body}")
+            return False
+        try:
+            _validate_sync_plan(body)
+        except AssertionError as e:
+            print(f"   sync-window plan validation failed: {e}")
+            print(json.dumps(body, indent=2))
+            return False
+        picks = ", ".join(f"[{p['index']}]={p['value']}"
+                          for p in body["plan"]["sync_windows"])
+        print(f"   sync-window compile: PASS (picked {picks})")
+
+        status, body = _request("POST",
+                                f"{base_url}/api/delay-plans/compile",
+                                SYNC_CONFLICT_REQUEST)
+        if status != 422:
+            print(f"   sync conflict request expected 422, got {status}: "
+                  f"{body}")
+            return False
+        if "conflicts" not in body or not body["conflicts"]:
+            print("   sync 422 body must list conflict intervals")
+            return False
+        if any(k in body for k in ("delays", "ramps", "plan")):
+            print("   sync infeasible response leaked a partial plan")
+            return False
+        c0 = body["conflicts"][0]
+        if c0.get("kind") != "sync_window" or (c0["start"], c0["end"]) != (8, 8):
+            print(f"   sync conflict must localize the window range: {c0}")
+            return False
+        print(f"   sync conflict request: PASS (422 {c0.get('reason')} "
+              f"[{c0['start']},{c0['end']}], no partial plan)")
 
         status, body = _request("POST",
                                 f"{base_url}/api/delay-plans/compile",

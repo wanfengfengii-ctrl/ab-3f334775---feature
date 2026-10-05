@@ -148,5 +148,55 @@ class HttpTests(unittest.TestCase):
                     self.assertEqual(x[i + 1] - x[i], r["delta"])
 
 
+    def test_sync_window_compile_success(self):
+        with ServerHarness() as h:
+            payload = dict(GOOD_PAYLOAD, sync_windows=[
+                {"start": 2, "end": 4, "value": 3},
+                {"start": 8, "end": 9, "value": 9}])
+            status, body = h.post("/api/delay-plans/compile", payload)
+            self.assertEqual(status, 200, body)
+            plan = body["plan"]
+            picked = plan["sync_windows"]
+            self.assertEqual([p["value"] for p in picked], [3, 9])
+            x = plan["delays"]
+            for w, p in zip(payload["sync_windows"], picked):
+                self.assertGreaterEqual(p["index"], w["start"])
+                self.assertLessEqual(p["index"], w["end"])
+                self.assertEqual(x[p["index"]], w["value"])
+                self.assertEqual(sum(1 for i in range(w["start"], w["end"] + 1)
+                                     if x[i] == w["value"]), 1)
+
+    def test_sync_window_omitted_is_backward_compatible(self):
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", GOOD_PAYLOAD)
+            self.assertEqual(status, 200)
+            self.assertNotIn("sync_windows", body["plan"])
+
+    def test_sync_window_malformed_returns_400_with_field(self):
+        with ServerHarness() as h:
+            payload = dict(GOOD_PAYLOAD, sync_windows=[
+                {"start": 4, "end": 2, "value": 3}])
+            status, body = h.post("/api/delay-plans/compile", payload)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["field"], "sync_windows[0].start")
+            self.assertNotIn("delays", body)
+
+    def test_sync_window_joint_infeasible_returns_422_range(self):
+        with ServerHarness() as h:
+            payload = dict(GOOD_PAYLOAD, max_step=1, max_ramps=3,
+                           sync_windows=[{"start": 2, "end": 4, "value": 9}])
+            status, body = h.post("/api/delay-plans/compile", payload)
+            self.assertEqual(status, 422, body)
+            conf = body["conflicts"]
+            self.assertTrue(conf)
+            c = conf[0]
+            self.assertEqual(c["kind"], "sync_window")
+            self.assertEqual((c["start"], c["end"]), (2, 4))
+            self.assertEqual(c["value"], 9)
+            self.assertNotIn("delays", body)
+            self.assertNotIn("ramps", body)
+            self.assertNotIn("plan", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

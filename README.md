@@ -23,6 +23,9 @@
     {"index": 0, "value": 10},
     {"index": 8, "value": 26},
     {"index": 15, "value": 40}
+  ],
+  "sync_windows": [
+    {"start": 3, "end": 6, "value": 17}
   ]
 }
 ```
@@ -34,6 +37,14 @@
 | `max_step` | 相邻阵元延迟差绝对值上限（非负整数） |
 | `max_ramps` | 最多斜坡数（1…n−1） |
 | `anchors` | 2–8 个必须精确命中的阵元 `{index, value}` |
+| `sync_windows` | 可选，1–3 个跨时钟域同步窗口（见下）；省略时请求/响应/最优结果/失败语义完全不变 |
+
+`sync_windows`（探头控制器跨时钟域交接窗口）：
+
+- 每项为零基闭区间 `{start, end, value}`，`start <= end` 且 `0 <= start/end < n`；
+- `value` 为落在全局延迟范围内的整数；
+- 各项按 `start` 递增排列，区间互不重叠（相邻窗口的 `start` 必须大于前一项的 `end`）；
+- 启用后，每个窗口内**恰有一个**阵元的 `delay == value`，供固件确定唯一跨域采样点。
 
 成功响应（200）：
 
@@ -57,6 +68,9 @@
 - `errors[i] = delays[i] - targets[i]`（带符号整数）。
 - `ramps` 给出每个极大相等差段的起止阵元（含端点）与该段整数差值，
   各段首尾相接且相邻段 `delta` 不同；`ramp_count` 即实际斜坡数。
+- 仅当请求携带 `sync_windows` 时，响应 `plan` 额外包含
+  `sync_windows`：按请求顺序为每个窗口返回唯一点中的
+  `{index, value}`；窗口内其余阵元均不等于该值。
 
 不可行响应（422，不含 `delays`/部分表）：
 
@@ -81,6 +95,13 @@
 - `empty_band`：区间/步长传播后某阵元无可行整数值。
 - `ramp_budget`：可达性满足但任何可行序列的斜坡数都超过 `max_ramps`，
   同时返回各锚点段信息便于定位。
+- `sync_window`：同步窗口与锚点/步长/斜坡预算共同导致无解，
+  `[start, end]` 定位致因窗口（多窗口共同致因时给出其并集跨度与
+  `windows` 成员列表），`reason` 进一步区分为
+  `no_admissible_value`（锚点锥/全局区间下窗口内没有任何位置能取到
+  `value`）、`multiple_forced_hits`（窗口内两个以上位置被锚点强制等于
+  `value`，必然超过一次命中）、`exactly_one_hit`（放宽斜坡预算仍无解）
+  或 `ramp_budget`（仅在给定斜坡预算下无解）。
 
 请求格式错误返回 400；JSON 非法返回 400；未知路由 404；错误方法 405。
 
@@ -94,11 +115,15 @@
 3. 固定最优 E 后，带“剩余斜坡预算”维的后向 DP 计算
    `(后缀总绝对误差, 后缀新增斜坡数)`，再从左到右贪心恢复，
    得到总误差、斜坡数最优前提下的字典序最小序列。
+4. 提供 `sync_windows` 时，两套 DP 额外携带“当前窗口命中计数
+   （0 或 1，超过即剪枝）/窗口间已完成状态”，窗口闭合时只保留
+   恰命中一次的状态；无解时枚举至多 7 个窗口子集定位致因窗口并区分
+   结构冲突与斜坡预算冲突。
 
 ## 本地运行（无需 Docker）
 
 ```bash
-python3 -m unittest discover -s tests -v   # 25 个测试（含 440+ 暴力枚举对照）
+python3 -m unittest discover -s tests -v   # 53 个测试（含 1100+ 暴力枚举对照）
 API_PORT=8080 python3 -m app.server         # 启动服务
 curl -s localhost:8080/healthz
 ```

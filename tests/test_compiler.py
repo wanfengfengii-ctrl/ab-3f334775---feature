@@ -32,7 +32,8 @@ def ramps_of(x):
     return runs
 
 
-def brute_force_optimum(targets, lo, hi, step, max_ramps, anchors):
+def brute_force_optimum(targets, lo, hi, step, max_ramps, anchors,
+                        sync_windows=()):
     """Return the optimal feasible sequence by full enumeration."""
     n = len(targets)
     best = None
@@ -43,6 +44,9 @@ def brute_force_optimum(targets, lo, hi, step, max_ramps, anchors):
             continue
         r = ramps_of(x)
         if r > max_ramps:
+            continue
+        if any(sum(1 for i in range(s, e + 1) if x[i] == v) != 1
+               for s, e, v in sync_windows):
             continue
         errs = [abs(x[i] - targets[i]) for i in range(n)]
         key = (max(errs), sum(errs), r, x)
@@ -131,6 +135,87 @@ class BruteForceTests(unittest.TestCase):
             key = (plan["max_abs_error"], plan["total_abs_error"],
                    plan["ramp_count"], tuple(plan["delays"]))
             self.assertEqual(key, bf[0], msg=f"{payload}\n{plan}")
+
+
+class SyncWindowBruteForceTests(unittest.TestCase):
+    """Exhaustive comparison with sync windows enabled."""
+
+    def setUp(self):
+        self._saved = (compiler.MIN_ELEMENTS, compiler.MIN_ANCHORS)
+        compiler.MIN_ELEMENTS = 4
+        compiler.MIN_ANCHORS = 2
+
+    def tearDown(self):
+        compiler.MIN_ELEMENTS, compiler.MIN_ANCHORS = self._saved
+
+    def _run(self, seed, trials, n_choices, max_windows):
+        rng = random.Random(seed)
+        for trial in range(trials):
+            n = rng.choice(n_choices)
+            lo, hi = -2, 3
+            step = rng.randint(1, 3)
+            ai = sorted(rng.sample(range(n), 2))
+            av = [rng.randint(lo, hi)]
+            av.append(max(lo, min(hi, rng.randint(
+                av[0] - step * (ai[1] - ai[0]),
+                av[0] + step * (ai[1] - ai[0])))))
+            anchors = {ai[0]: av[0], ai[1]: av[1]}
+            targets = [rng.randint(lo - 1, hi + 1) for _ in range(n)]
+            max_ramps = rng.randint(1, n - 1)
+
+            # Build disjoint windows sorted by start from random boundary
+            # pairs; skip a trial whose draw cannot form disjoint windows.
+            nw = rng.randint(1, max_windows)
+            bounds = sorted(rng.sample(range(n + 1), 2 * nw))
+            windows = []
+            ok = True
+            for j in range(nw):
+                s, e = bounds[2 * j], bounds[2 * j + 1] - 1
+                if s > e or (windows and s <= windows[-1][1]):
+                    ok = False
+                    break
+                windows.append((s, e, rng.randint(lo, hi)))
+            if not ok:
+                continue
+
+            payload = {
+                "targets": targets, "delay_min": lo, "delay_max": hi,
+                "max_step": step, "max_ramps": max_ramps,
+                "anchors": [{"index": i, "value": v}
+                            for i, v in anchors.items()],
+                "sync_windows": [{"start": s, "end": e, "value": v}
+                                 for s, e, v in windows],
+            }
+            bf = brute_force_optimum(targets, lo, hi, step, max_ramps,
+                                     anchors, windows)
+            if bf is None:
+                with self.assertRaises(CompileError) as ctx:
+                    compile_plan(payload)
+                self.assertEqual(ctx.exception.status, 422,
+                                 msg=f"trial {trial}: {payload}")
+                self.assertNotIn("delays", ctx.exception.details)
+                continue
+            plan = compile_plan(payload)
+            x = plan["delays"]
+            key = (plan["max_abs_error"], plan["total_abs_error"],
+                   plan["ramp_count"], tuple(x))
+            self.assertEqual(key, bf[0],
+                             msg=f"trial {trial}: {payload}\n{plan}")
+            self.assertEqual(x, bf[1], msg=f"lex tie trial {trial}")
+            self.assertEqual(len(plan["sync_windows"]), len(windows))
+            for (s, e, v), picked in zip(windows, plan["sync_windows"]):
+                self.assertEqual(picked["value"], v)
+                self.assertIn(picked["index"], range(s, e + 1))
+                self.assertEqual(x[picked["index"]], v)
+                self.assertEqual(sum(1 for i in range(s, e + 1)
+                                     if x[i] == v), 1)
+
+    def test_gapped_windows_match_brute_force(self):
+        self._run(20261005, 500, (4, 5), 2)
+
+    def test_three_adjacent_windows_match_brute_force(self):
+        # n == 6 tiled into three adjacent two-element windows.
+        self._run(31337, 250, (6,), 3)
 
 
 class PlanInvariantTests(unittest.TestCase):
@@ -319,6 +404,257 @@ class ValidationTests(unittest.TestCase):
             anchors=[{"index": 0, "value": 2}, {"index": 11, "value": 9}]))
         self.assertEqual(plan["delays"][0], 2)
         self.assertEqual(plan["delays"][11], 9)
+
+
+class SyncWindowBehaviorTests(unittest.TestCase):
+    def _payload(self, **over):
+        base = {
+            "targets": [0, 2, 5, 9, 12, 14, 15, 14, 12, 9, 5, 2],
+            "delay_min": -50, "delay_max": 50, "max_step": 4,
+            "max_ramps": 4,
+            "anchors": [{"index": 0, "value": 0},
+                        {"index": 6, "value": 15},
+                        {"index": 11, "value": 2}],
+        }
+        base.update(over)
+        return base
+
+    def test_selected_indexes_returned_in_request_order(self):
+        windows = [{"start": 2, "end": 4, "value": 8},
+                   {"start": 7, "end": 9, "value": 10}]
+        plan = compile_plan(self._payload(sync_windows=windows))
+        picked = plan["sync_windows"]
+        self.assertEqual([p["value"] for p in picked], [8, 10])
+        x = plan["delays"]
+        for w, p in zip(windows, picked):
+            self.assertIn(p["index"], range(w["start"], w["end"] + 1))
+            self.assertEqual(x[p["index"]], w["value"])
+            self.assertEqual(sum(1 for i in range(w["start"], w["end"] + 1)
+                                 if x[i] == w["value"]), 1)
+
+    def test_exactly_one_hit_even_when_targets_prefer_more(self):
+        # Targets equal the sync value at every window position; the
+        # optimizer must move all but one off it.
+        windows = [{"start": 2, "end": 5, "value": 12}]
+        p = self._payload(sync_windows=windows)
+        plan = compile_plan(p)
+        x = plan["delays"]
+        hits = [i for i in range(2, 6) if x[i] == 12]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(plan["sync_windows"][0]["index"], hits[0])
+
+    def test_three_windows_including_singleton_and_adjacent(self):
+        # Singleton window [1,1] sits directly adjacent to [2,3].
+        windows = [{"start": 1, "end": 1, "value": 2},
+                   {"start": 2, "end": 3, "value": 5},
+                   {"start": 9, "end": 10, "value": 5}]
+        plan = compile_plan(self._payload(max_ramps=6, sync_windows=windows))
+        self.assertEqual(len(plan["sync_windows"]), 3)
+        self.assertEqual(plan["sync_windows"][0],
+                         {"index": 1, "value": 2})
+        self.assertEqual(plan["sync_windows"][1]["value"], 5)
+        self.assertIn(plan["sync_windows"][1]["index"], (2, 3))
+        x = plan["delays"]
+        for w in windows:
+            self.assertEqual(sum(1 for i in range(w["start"], w["end"] + 1)
+                                 if x[i] == w["value"]), 1)
+
+    def test_omitted_field_keeps_response_shape(self):
+        plan = compile_plan(self._payload())
+        self.assertNotIn("sync_windows", plan)
+
+    def test_window_honored_alongside_anchors_step_and_ramp_budget(self):
+        windows = [{"start": 8, "end": 10, "value": 10}]
+        plan = compile_plan(self._payload(sync_windows=windows))
+        x = plan["delays"]
+        for a in self._payload()["anchors"]:
+            self.assertEqual(x[a["index"]], a["value"])
+        self.assertTrue(all(abs(x[i + 1] - x[i]) <= 4
+                            for i in range(len(x) - 1)))
+        self.assertLessEqual(plan["ramp_count"], 4)
+        self.assertEqual(sum(1 for i in range(8, 11) if x[i] == 10), 1)
+
+    def test_deterministic_with_windows(self):
+        p = self._payload(sync_windows=[{"start": 2, "end": 4, "value": 8}])
+        self.assertEqual(compile_plan(p), compile_plan(p))
+
+
+class SyncWindowInfeasibilityTests(unittest.TestCase):
+    BASE = dict(targets=[0] * 12, delay_min=-10, delay_max=10,
+                max_step=1, max_ramps=3,
+                anchors=[{"index": 0, "value": 0},
+                         {"index": 11, "value": 0}])
+
+    def _assert_422(self, payload, reason=None, span=None):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(payload)
+        self.assertEqual(ctx.exception.status, 422)
+        details = ctx.exception.details
+        self.assertNotIn("delays", details)
+        self.assertNotIn("ramps", details)
+        conf = details["conflicts"]
+        self.assertTrue(conf)
+        self.assertTrue(all(c["kind"] == "sync_window" for c in conf))
+        if reason is not None:
+            self.assertTrue(any(c["reason"] == reason for c in conf))
+        if span is not None:
+            self.assertIn(span, {(c["start"], c["end"]) for c in conf})
+        return conf
+
+    def test_window_value_outside_anchor_cone(self):
+        # With step 1 and both anchors pinned to 0, element 2 can only be
+        # in [-2, 2]; asking for 9 is jointly impossible.
+        p = dict(self.BASE,
+                 sync_windows=[{"start": 2, "end": 4, "value": 9}])
+        conf = self._assert_422(p, "no_admissible_value", (2, 4))
+        self.assertEqual(conf[0]["value"], 9)
+
+    def test_window_against_anchor_value_at_same_index(self):
+        # The anchor at 5 fixes x[5]=0; a singleton window demanding x[5]=3
+        # directly contradicts it.
+        p = dict(self.BASE, max_step=5,
+                 anchors=[{"index": 0, "value": 0},
+                          {"index": 5, "value": 0},
+                          {"index": 11, "value": 0}],
+                 sync_windows=[{"start": 5, "end": 5, "value": 3}])
+        self._assert_422(p, "no_admissible_value", (5, 5))
+
+    def test_two_equal_anchors_inside_window_force_two_hits(self):
+        p = dict(self.BASE, max_step=5,
+                 anchors=[{"index": 3, "value": 4},
+                          {"index": 7, "value": 4},
+                          {"index": 11, "value": 4}],
+                 sync_windows=[{"start": 2, "end": 8, "value": 4}])
+        conf = self._assert_422(p, "multiple_forced_hits", (2, 8))
+        self.assertEqual(conf[0]["forced_indices"][:2], [3, 7])
+
+    def test_joint_ramp_budget_infeasibility(self):
+        # One ramp with equal end anchors forces the constant zero plan;
+        # hitting 4 once needs a departure and return (>= 3 ramps).
+        p = dict(self.BASE, max_step=2, max_ramps=1,
+                 sync_windows=[{"start": 3, "end": 8, "value": 4}])
+        self._assert_422(p, "ramp_budget", (3, 8))
+
+    def test_stable_422_across_calls(self):
+        p = dict(self.BASE,
+                 sync_windows=[{"start": 2, "end": 4, "value": 9}])
+        blobs = set()
+        for _ in range(3):
+            try:
+                compile_plan(p)
+                self.fail("expected 422")
+            except CompileError as e:
+                self.assertEqual(e.status, 422)
+                blobs.add(json.dumps(e.details, sort_keys=True))
+        self.assertEqual(len(blobs), 1)
+
+
+class SyncWindowValidationTests(unittest.TestCase):
+    def _ok(self, **over):
+        base = {"targets": list(range(12)), "delay_min": 0, "delay_max": 100,
+                "max_step": 5, "max_ramps": 3,
+                "anchors": [{"index": 0, "value": 0},
+                            {"index": 11, "value": 11}]}
+        base.update(over)
+        return base
+
+    def test_not_an_array(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows={"start": 0}))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"], "sync_windows")
+
+    def test_empty_array(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[]))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"], "sync_windows")
+
+    def test_four_windows_rejected(self):
+        wins = [{"start": i, "end": i, "value": 0} for i in range(4)]
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=wins))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"], "sync_windows")
+
+    def test_missing_field_localized(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[{"start": 0, "end": 1}]))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"],
+                         "sync_windows[0].value")
+
+    def test_non_integer_member(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows="nope"))
+        self.assertEqual(ctx.exception.status, 400)
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[
+                {"start": 1.5, "end": 2, "value": 3}]))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"],
+                         "sync_windows[0].start")
+
+    def test_index_out_of_range(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[
+                {"start": 0, "end": 12, "value": 3}]))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"],
+                         "sync_windows[0].end")
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[
+                {"start": -1, "end": 2, "value": 3}]))
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_start_after_end(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[
+                {"start": 5, "end": 2, "value": 3}]))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"],
+                         "sync_windows[0].start")
+
+    def test_value_outside_global_range(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[
+                {"start": 0, "end": 2, "value": 101}]))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"],
+                         "sync_windows[0].value")
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[
+                {"start": 0, "end": 2, "value": -1}]))
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_unsorted_windows_rejected(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[
+                {"start": 6, "end": 7, "value": 6},
+                {"start": 2, "end": 3, "value": 2}]))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"],
+                         "sync_windows[1].start")
+
+    def test_overlapping_windows_rejected(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[
+                {"start": 2, "end": 5, "value": 3},
+                {"start": 5, "end": 7, "value": 4}]))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"],
+                         "sync_windows[1].start")
+        # touching with a gap of at least one element is fine (6 > 5)
+        plan = compile_plan(self._ok(sync_windows=[
+            {"start": 2, "end": 5, "value": 3},
+            {"start": 6, "end": 7, "value": 4}]))
+        self.assertEqual(len(plan["sync_windows"]), 2)
+
+    def test_member_not_object(self):
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(self._ok(sync_windows=[42]))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(ctx.exception.details["field"], "sync_windows[0]")
 
 
 class RampBoundaryTests(unittest.TestCase):
