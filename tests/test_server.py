@@ -148,5 +148,65 @@ class HttpTests(unittest.TestCase):
                     self.assertEqual(x[i + 1] - x[i], r["delta"])
 
 
+class SyncWindowHttpTests(unittest.TestCase):
+    def test_compile_with_sync_windows(self):
+        # The unconstrained optimum (delays == targets) already places a
+        # unique 2 inside [2,4], so the plan is unchanged and the selected
+        # element is reported back in request order.
+        p = dict(GOOD_PAYLOAD,
+                 sync_windows=[{"start": 2, "end": 4, "value": 2}])
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", p)
+            self.assertEqual(status, 200, body)
+            plan = body["plan"]
+            self.assertEqual(plan["delays"], list(range(12)))
+            self.assertEqual(plan["sync_windows"],
+                             [{"index": 2, "value": 2}])
+
+    def test_sync_window_moves_optimum(self):
+        p = dict(GOOD_PAYLOAD,
+                 sync_windows=[{"start": 2, "end": 4, "value": 5}])
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", p)
+            self.assertEqual(status, 200, body)
+            plan = body["plan"]
+            x = plan["delays"]
+            hits = [i for i in range(2, 5) if x[i] == 5]
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(plan["sync_windows"],
+                             [{"index": hits[0], "value": 5}])
+            self.assertLessEqual(plan["ramp_count"], p["max_ramps"])
+
+    def test_sync_conflict_422_with_window_range_and_no_partial_plan(self):
+        p = dict(GOOD_PAYLOAD, max_step=1,
+                 sync_windows=[{"start": 0, "end": 2, "value": 5}])
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", p)
+            self.assertEqual(status, 422)
+            self.assertNotIn("delays", body)
+            self.assertNotIn("ramps", body)
+            self.assertNotIn("plan", body)
+            self.assertTrue(body["conflicts"])
+            c = body["conflicts"][0]
+            self.assertEqual(c["kind"], "sync_window")
+            self.assertEqual((c["start"], c["end"]), (0, 2))
+
+    def test_invalid_sync_window_400_locates_field(self):
+        p = dict(GOOD_PAYLOAD, sync_windows=[
+            {"start": 0, "end": 3, "value": 1},
+            {"start": 2, "end": 5, "value": 4}])
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", p)
+            self.assertEqual(status, 400)
+            self.assertEqual(body["field"], "sync_windows[1].start")
+            self.assertNotIn("delays", body)
+
+    def test_omitted_sync_windows_keeps_response_shape(self):
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", GOOD_PAYLOAD)
+            self.assertEqual(status, 200, body)
+            self.assertNotIn("sync_windows", body["plan"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

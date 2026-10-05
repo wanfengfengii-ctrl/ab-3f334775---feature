@@ -11,7 +11,10 @@ A sequence ``x[0..n-1]`` is feasible when:
 * every anchor ``x[index] == value`` holds exactly;
 * ``|x[i+1] - x[i]| <= max_step``;
 * the number of maximal constant runs (ramps) of the adjacent-difference
-  sequence ``d[i] = x[i+1] - x[i]`` does not exceed ``max_ramps``.
+  sequence ``d[i] = x[i+1] - x[i]`` does not exceed ``max_ramps``;
+* optionally, every *sync window* ``[start, end]`` contains exactly one
+  position whose delay equals the window ``value`` (the clock-domain
+  handoff needs a unique cross-domain sampling point).
 
 Optimization order, lexicographic (the first differing key decides):
 
@@ -34,6 +37,12 @@ Algorithms
 * With the optimal error budget fixed, a backward DP computes the best
   suffix cost ``(sum abs error, new ramps)`` for every state and the plan is
   recovered greedily, which yields the lexicographically smallest optimum.
+* Optional sync windows add one carried bit to both DPs -- whether the
+  window covering the current position has already consumed its single
+  allowed placement.  Windows are validated non-overlapping and sorted by
+  ``start``, so at most one window covers any position and one bit
+  suffices.  When the field is omitted the original code paths run
+  unchanged.
 """
 
 from __future__ import annotations
@@ -44,6 +53,8 @@ MIN_ELEMENTS = 12
 MAX_ELEMENTS = 48
 MIN_ANCHORS = 2
 MAX_ANCHORS = 8
+MIN_SYNC_WINDOWS = 1
+MAX_SYNC_WINDOWS = 3
 
 # Safety valve for pathological integer domains (firmware delay values are
 # bounded in practice).  A DP working window wider than this many integer
@@ -162,6 +173,8 @@ def validate_request(payload) -> dict:
                 {"field": f"anchors[{k}].index", "index": idx})
         anchors[idx] = val
 
+    windows = _validate_sync_windows(payload.get("sync_windows"), n, lo, hi)
+
     return {
         "n": n,
         "targets": int_targets,
@@ -170,7 +183,65 @@ def validate_request(payload) -> dict:
         "max_step": max_step,
         "max_ramps": max_ramps,
         "anchors": anchors,
+        "sync_windows": windows,
     }
+
+
+def _validate_sync_windows(raw, n, lo, hi):
+    """Validate the optional ``sync_windows`` field.
+
+    Returns a list of ``(start, end, value)`` tuples in request order; an
+    omitted (or explicit null) field yields an empty list.  Every violation
+    is a 400 locating the exact ``sync_windows[k].*`` field.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise CompileError("'sync_windows' must be an array", 400,
+                           {"field": "sync_windows"})
+    if not (MIN_SYNC_WINDOWS <= len(raw) <= MAX_SYNC_WINDOWS):
+        raise CompileError(
+            f"'sync_windows' must contain between {MIN_SYNC_WINDOWS} and "
+            f"{MAX_SYNC_WINDOWS} entries (got {len(raw)})", 400,
+            {"field": "sync_windows"})
+    windows = []
+    prev_end = None
+    for k, w in enumerate(raw):
+        field = f"sync_windows[{k}]"
+        if not isinstance(w, dict):
+            raise CompileError(f"{field} must be an object", 400,
+                               {"field": field})
+        if not all(key in w for key in ("start", "end", "value")):
+            raise CompileError(
+                f"{field} requires 'start', 'end' and 'value'", 400,
+                {"field": field})
+        s = _as_int(f"{field}.start", w["start"])
+        e = _as_int(f"{field}.end", w["end"])
+        v = _as_int(f"{field}.value", w["value"])
+        if s < 0:
+            raise CompileError(
+                f"{field}.start={s} out of range [0,{n - 1}]", 400,
+                {"field": f"{field}.start"})
+        if e > n - 1:
+            raise CompileError(
+                f"{field}.end={e} out of range [0,{n - 1}]", 400,
+                {"field": f"{field}.end"})
+        if s > e:
+            raise CompileError(
+                f"{field}.end={e} precedes start={s}", 400,
+                {"field": f"{field}.end"})
+        if not (lo <= v <= hi):
+            raise CompileError(
+                f"{field}.value={v} out of range [{lo},{hi}]", 400,
+                {"field": f"{field}.value"})
+        if prev_end is not None and s <= prev_end:
+            raise CompileError(
+                f"{field}.start={s} overlaps or precedes the previous "
+                f"window (ends at {prev_end})", 400,
+                {"field": f"{field}.start"})
+        prev_end = e
+        windows.append((s, e, v))
+    return windows
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +586,376 @@ def optimal_plan(req, widths) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Sync windows: exactly one element per window lands on the window value
+# ---------------------------------------------------------------------------
+#
+# A sync window [start, end] with value v constrains the compiled sequence
+# to take the value v at exactly one position inside the closed interval
+# (the clock-domain handoff needs a unique cross-domain sampling point).
+# Windows are validated non-overlapping and sorted by start, so at most one
+# window covers any position and a single carried bit -- "the window
+# covering this position has already consumed its one placement" --
+# extends both DPs.  All of this is used only when the request carries
+# sync_windows; the window-free code paths above are unchanged.
+
+
+def _sync_arrays(n, windows):
+    """Per-position view of ``windows`` [(start, end, value), ...].
+
+    Returns ``(sid, sval, send)``: the id of the window covering each
+    position (or None), the value that window requires there, and whether
+    the position closes its window.
+    """
+    sid = [None] * n
+    sval = [None] * n
+    send = [False] * n
+    for k, (s, e, v) in enumerate(windows):
+        for i in range(s, e + 1):
+            sid[i] = k
+            sval[i] = v
+        send[e] = True
+    return sid, sval, send
+
+
+def _best_two_by_c(p: dict):
+    """``_best_two`` applied per carry class of a ``(delta, c) -> ramps`` map."""
+    out = {}
+    for (d, c), v in p.items():
+        cur = out.get(c)
+        if cur is None:
+            out[c] = (v, d, None)
+            continue
+        m1, k1, m2 = cur
+        if v < m1:
+            out[c] = (v, d, m1)
+        elif m2 is None or v < m2:
+            out[c] = (m1, k1, v)
+    return out
+
+
+def feasible_with_widths_sync(req, widths, windows) -> bool:
+    """Ramp-budget feasibility with sync windows enforced.
+
+    Mirrors :func:`feasible_with_widths`; states carry one extra bit telling
+    whether the window covering the current position has already consumed
+    its single placement of the window value.
+    """
+    step = req["max_step"]
+    cap = req["max_ramps"]
+    n = req["n"]
+    sid, sval, send = _sync_arrays(n, windows)
+
+    prev = {}
+    for v in range(widths[0][0], widths[0][1] + 1):
+        c = 0
+        if sid[0] is not None:
+            c = 1 if v == sval[0] else 0
+            if send[0] and not c:
+                continue  # singleton window missed its required value
+        prev[v] = {(None, c): 0}
+    if not prev:
+        return False
+    stats = {u: _best_two_by_c(p) for u, p in prev.items()}
+
+    for i in range(1, n):
+        lo_w, hi_w = widths[i]
+        plo, phi = widths[i - 1]
+        if (hi_w - lo_w + 1) * min(2 * step + 1, phi - plo + 1) * 2 \
+                > MAX_LAYER_OPS:
+            raise CompileError(
+                "integer delay domain too large to compile exactly at "
+                f"element {i}; tighten 'delay_min'/'delay_max' or reduce "
+                "the target spread", 400, {"element": i})
+        same_window = sid[i] is not None and sid[i - 1] == sid[i]
+        cur = {}
+        for v in range(lo_w, hi_w + 1):
+            entry = {}
+            ua = max(plo, v - step)
+            ub = min(phi, v + step)
+            for u in range(ua, ub + 1):
+                st = stats.get(u)
+                if st is None:
+                    continue
+                d = v - u
+                for c_prev, (m1, k1, m2) in st.items():
+                    carry = c_prev if same_window else 0
+                    if sid[i] is not None:
+                        if v == sval[i]:
+                            if carry:
+                                continue  # second placement in this window
+                            c_new = 1
+                        else:
+                            c_new = carry
+                        if send[i] and not c_new:
+                            continue  # window closed without its placement
+                    else:
+                        c_new = 0
+                    cont = prev[u].get((d, c_prev))
+                    brk = m1 if k1 != d else m2
+                    if brk is not None:
+                        brk += 1
+                    best = None
+                    if cont is not None:
+                        best = cont
+                    if brk is not None and (best is None or brk < best):
+                        best = brk
+                    if best is not None and best <= cap:
+                        key = (d, c_new)
+                        old = entry.get(key)
+                        if old is None or best < old:
+                            entry[key] = best
+            if entry:
+                cur[v] = entry
+        if not cur:
+            return False
+        prev = cur
+        stats = {u: _best_two_by_c(p) for u, p in prev.items()}
+    return True
+
+
+def ramp_feasible_on_bands_sync(req, bands, windows):
+    """Band-level ramp feasibility with sync windows.
+
+    Returns True/False when decidable within the configured domain guard,
+    or ``None`` when the integer domain is too large to decide here.
+    """
+    widths = []
+    for i, (a, b) in enumerate(bands):
+        if b - a + 1 > MAX_WINDOW:
+            return None
+        widths.append((a, b))
+    try:
+        return feasible_with_widths_sync(req, widths, windows)
+    except CompileError:
+        return None
+
+
+def optimal_plan_sync(req, widths, windows) -> list:
+    """Sync-window analogue of :func:`optimal_plan` (same objective order).
+
+    Assumes the sync feasibility DP has already proved that ``widths``
+    admits a sequence within the ramp budget.
+    """
+    n = req["n"]
+    step = req["max_step"]
+    cap = req["max_ramps"]
+    targets = req["targets"]
+    sid, sval, send = _sync_arrays(n, windows)
+
+    def vals(i):
+        return range(widths[i][0], widths[i][1] + 1)
+
+    def carries(i):
+        # Carried satisfaction bits reachable at position i: 0 always; 1
+        # only when the window covering i started earlier and may already
+        # be satisfied by the prefix.
+        if sid[i] is not None and i > 0 and sid[i - 1] == sid[i]:
+            return (0, 1)
+        return (0,)
+
+    # G[i][v] maps (din, b, c) -> (S, T) with the same meaning as in
+    # optimal_plan; c is the carried satisfaction bit of the window
+    # covering position i.
+    G = [None] * n
+
+    base = {}
+    keys_last = _incoming_keys(widths, n - 1, step)
+    for v in vals(n - 1):
+        ev = abs(v - targets[n - 1])
+        cell = {}
+        for c in carries(n - 1):
+            if sid[n - 1] is not None:
+                hit = v == sval[n - 1]
+                if hit and c:
+                    continue  # second placement in this window
+                if not (hit or c):
+                    continue  # window closes at n - 1 without its placement
+            for d in keys_last[v]:
+                for b in range(cap + 1):
+                    cell[(d, b, c)] = (ev, 0)
+        if cell:
+            base[v] = cell
+    G[n - 1] = base
+
+    for i in range(n - 2, -1, -1):
+        nlo, nhi = widths[i + 1]
+        keys_here = _incoming_keys(widths, i, step)
+        layer = {}
+        for v in vals(i):
+            ev = abs(v - targets[i])
+            wa = max(nlo, v - step)
+            wb = min(nhi, v + step)
+            feasible_w = list(range(wa, wb + 1))
+            cell = {}
+            for c in carries(i):
+                if sid[i] is not None:
+                    hit = v == sval[i]
+                    if hit and c:
+                        continue
+                    carry_out = 1 if (hit or c) else 0
+                    if send[i] and not carry_out:
+                        continue
+                else:
+                    carry_out = 0
+                c_next = carry_out if sid[i + 1] is not None \
+                    and sid[i + 1] == sid[i] else 0
+
+                # Best / second-best successor for starting a new ramp at
+                # edge i, per remaining budget, compared on (S, T, w).
+                best_new = {}
+                for b in range(1, cap + 1):
+                    w1 = None
+                    p1 = None
+                    w2 = None
+                    p2 = None
+                    for w in feasible_w:
+                        st = G[i + 1].get(w, {}).get((w - v, b - 1, c_next))
+                        if st is None:
+                            continue
+                        cand = (st[0], st[1], w)
+                        if p1 is None or cand < p1:
+                            w2, p2 = w1, p1
+                            w1, p1 = w, cand
+                        elif w != w1 and (p2 is None or cand < p2):
+                            w2, p2 = w, cand
+                    if p1 is not None:
+                        best_new[b] = (p1, w1, p2, w2)
+
+                for din in keys_here[v]:
+                    cont_w = None if din is None else v + din
+                    for b in range(cap + 1):
+                        best = None
+                        if cont_w is not None:
+                            st = G[i + 1].get(cont_w, {}).get(
+                                (din, b, c_next))
+                            if st is not None:
+                                best = (ev + st[0], st[1])
+                        if b >= 1:
+                            pre = best_new.get(b)
+                            if pre is not None:
+                                p1, w1, p2, w2 = pre
+                                s0, s1, _bw = p1 if w1 != cont_w else (
+                                    p2 if p2 is not None
+                                    else (None, None, None))
+                                if s0 is not None:
+                                    cand = (ev + s0, 1 + s1)
+                                    if best is None or cand < best:
+                                        best = cand
+                        if best is not None:
+                            cell[(din, b, c)] = best
+            if cell:
+                layer[v] = cell
+        G[i] = layer
+
+    # Greedy left-to-right reconstruction; the carried bit is threaded
+    # through the chosen prefix exactly as the DP transitions do.
+    x = [0] * n
+    prev_din = None
+    used_ramps = 0
+    carry = 0
+    for i in range(n):
+        if i == 0:
+            choices = []
+            for v in vals(0):
+                st = G[0].get(v, {}).get((None, cap, 0))
+                if st is not None:
+                    choices.append((st[0], st[1], v))
+            if not choices:  # pragma: no cover - guarded by feasibility DP
+                raise CompileError("internal reconstruction failure", 500)
+            _, _, vi = min(choices, key=lambda z: (z[0], z[1], z[2]))
+            x[0] = vi
+        else:
+            choices = []
+            for v in vals(i):
+                d = v - x[i - 1]
+                if abs(d) > step:
+                    continue
+                extra = 0 if d == prev_din else 1
+                b_remaining = cap - used_ramps - extra
+                if b_remaining < 0:
+                    continue
+                st = G[i].get(v, {}).get((d, b_remaining, carry))
+                if st is None:
+                    continue
+                total_ramps = used_ramps + extra + st[1]
+                choices.append((st[0], total_ramps, v, d))
+            if not choices:  # pragma: no cover - guarded by feasibility DP
+                raise CompileError("internal reconstruction failure", 500)
+            _, _, vi, di = min(choices, key=lambda z: (z[0], z[1], z[2]))
+            if di != prev_din:
+                used_ramps += 1
+            prev_din = di
+            x[i] = vi
+        if i + 1 < n:
+            if sid[i] is not None and sid[i + 1] == sid[i]:
+                carry = 1 if (carry or x[i] == sval[i]) else 0
+            else:
+                carry = 0
+    return x
+
+
+def _sync_structural_conflicts(bands, windows):
+    """Per-window band conflicts: value unreachable, or forced twice."""
+    conflicts = []
+    for (s, e, v) in windows:
+        forced = [i for i in range(s, e + 1)
+                  if bands[i][0] == bands[i][1] == v]
+        if len(forced) >= 2:
+            conflicts.append({
+                "kind": "sync_window", "start": s, "end": e, "value": v,
+                "reason": "value_forced_at_multiple_elements",
+                "forced_indices": forced})
+            continue
+        if not any(bands[i][0] <= v <= bands[i][1] for i in range(s, e + 1)):
+            conflicts.append({
+                "kind": "sync_window", "start": s, "end": e, "value": v,
+                "reason": "value_unreachable_in_window"})
+    return conflicts
+
+
+def _sync_combination_conflicts(req, bands, windows):
+    """Localize a sync-window infeasibility to a minimal set of windows.
+
+    The full window set is known infeasible on the bands while the
+    window-free instance is feasible; greedily dropping windows that keep
+    it infeasible yields a deterministic minimal culprit set.
+    """
+    culprit = list(windows)
+    for w in windows:
+        if len(culprit) == 1:
+            break
+        trial = [x for x in culprit if x != w]
+        if ramp_feasible_on_bands_sync(req, bands, trial) is False:
+            culprit = trial
+    return [
+        {"kind": "sync_window", "start": s, "end": e, "value": v,
+         "reason": "infeasible_combination", "max_ramps": req["max_ramps"]}
+        for (s, e, v) in culprit]
+
+
+def _sync_assignments(x, windows):
+    """Selected handoff element per window, in request order."""
+    out = []
+    for (s, e, v) in windows:
+        hits = [i for i in range(s, e + 1) if x[i] == v]
+        if len(hits) != 1:  # pragma: no cover - enforced by the DPs
+            raise CompileError("internal reconstruction failure", 500)
+        out.append({"index": hits[0], "value": v})
+    return out
+
+
+def _probe_sync(req, bands, budget, windows):
+    """``_probe`` with sync windows enforced."""
+    widths = _widths_under_budget(req, bands, budget)
+    if widths is None:
+        return False
+    try:
+        return feasible_with_widths_sync(req, widths, windows)
+    except CompileError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -578,6 +1019,9 @@ def compile_plan(payload) -> dict:
 
     Raises :class:`CompileError` for malformed input (400) or infeasible
     instances (422).  Infeasible responses never contain a delay table.
+    When the request carries ``sync_windows``, the plan additionally lists
+    the selected handoff element per window under ``"sync_windows"``;
+    without the field the request/response shape is unchanged.
     """
     req = validate_request(payload)
     sr = structural_check(req)
@@ -586,6 +1030,15 @@ def compile_plan(payload) -> dict:
             "no feasible delay plan: anchor/step conflict", 422,
             {"conflicts": [c.to_dict() for c in sr.conflicts]})
     bands = sr.bands
+    windows = req["sync_windows"]
+
+    if windows:
+        conflicts = _sync_structural_conflicts(bands, windows)
+        if conflicts:
+            raise CompileError(
+                "no feasible delay plan: sync window conflict", 422,
+                {"conflicts": conflicts})
+
     t = req["targets"]
     esat = _saturation_budget(req, bands)
 
@@ -596,18 +1049,30 @@ def compile_plan(payload) -> dict:
             "no feasible delay plan within the ramp budget", 422,
             {"conflicts": [_ramp_budget_conflict(req)]})
 
+    # Same check with the sync windows enforced; infeasibility here is
+    # localized to a minimal culprit set of windows.
+    if windows and ramp_feasible_on_bands_sync(req, bands, windows) is False:
+        raise CompileError(
+            "no feasible delay plan: sync window conflict", 422,
+            {"conflicts": _sync_combination_conflicts(req, bands, windows)})
+
+    def probe(budget):
+        if windows:
+            return _probe_sync(req, bands, budget, windows)
+        return _probe(req, bands, budget)
+
     # Binary search the optimum budget within the exactly decidable domain.
     # Probe outcomes: True feasible, False infeasible, None means the exact
     # DP domain exceeds the configured guard.  The saturation budget is
     # feasible (ramp feasibility was established above); if probing it raises
     # the guard, locate the largest decidable budget and search below it.
-    if _probe(req, bands, esat) is None:
-        if _probe(req, bands, 0) is None:  # pragma: no cover - defensive
+    if probe(esat) is None:
+        if probe(0) is None:  # pragma: no cover - defensive
             raise _guard_refusal(req)
         safe, hi_guard = 0, esat
         while safe + 1 < hi_guard:
             mid = (safe + hi_guard) // 2
-            if _probe(req, bands, mid) is None:
+            if probe(mid) is None:
                 hi_guard = mid
             else:
                 safe = mid
@@ -618,7 +1083,7 @@ def compile_plan(payload) -> dict:
 
     while lo_e < hi_e:
         mid = (lo_e + hi_e) // 2
-        verdict = _probe(req, bands, mid)
+        verdict = probe(mid)
         if verdict is True:
             hi_e = mid
         else:
@@ -628,14 +1093,23 @@ def compile_plan(payload) -> dict:
     e_star = lo_e
 
     widths = _widths_under_budget(req, bands, e_star)
-    if widths is None or not feasible_with_widths(req, widths):
+    if widths is None:
+        raise _guard_refusal(req)
+    if windows:
+        decidable = feasible_with_widths_sync(req, widths, windows)
+    else:
+        decidable = feasible_with_widths(req, widths)
+    if not decidable:
         # Happens only when the optimum sits above every decidable budget.
         raise _guard_refusal(req)
 
-    x = optimal_plan(req, widths)
+    if windows:
+        x = optimal_plan_sync(req, widths, windows)
+    else:
+        x = optimal_plan(req, widths)
     errors = [x[i] - t[i] for i in range(req["n"])]
     ramps = ramp_boundaries(x)
-    return {
+    plan = {
         "n": req["n"],
         "delays": x,
         "errors": errors,
@@ -644,6 +1118,9 @@ def compile_plan(payload) -> dict:
         "max_abs_error": max(abs(e) for e in errors),
         "total_abs_error": sum(abs(e) for e in errors),
     }
+    if windows:
+        plan["sync_windows"] = _sync_assignments(x, windows)
+    return plan
 
 
 def _guard_refusal(req):

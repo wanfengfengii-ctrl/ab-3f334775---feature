@@ -2,13 +2,15 @@
 
 Aggregates three independent checks and exits non-zero if any of them fails:
 
-1. **code tests**      -- the full unittest suite (compiler + HTTP layer);
+1. **code tests**      -- the full unittest suite (compiler + HTTP layer),
+                          including the sync-window regression tests;
 2. **build artifacts** -- the manifest baked at image build time is compared
                           against the files actually present in the image;
-3. **API smoke**       -- health probe plus a typical compile request and an
-                          infeasible request against the running service
-                          (``API_BASE_URL``); if no service URL is given, an
-                          in-process server is started for the smoke checks.
+3. **API smoke**       -- health probe plus a typical compile request, a
+                          sync-window compile request and infeasible requests
+                          against the running service (``API_BASE_URL``); if
+                          no service URL is given, an in-process server is
+                          started for the smoke checks.
 
 The final line is a machine-readable summary and the process exit code is the
 number of failed check groups (0 == all green).
@@ -49,6 +51,22 @@ CONFLICT_REQUEST = dict(
     TYPICAL_REQUEST,
     max_step=1,
     anchors=[{"index": 0, "value": 10}, {"index": 15, "value": 40}],
+)
+
+# The unconstrained optimum (delays == targets) already places a unique
+# window value inside each window, so both assignments are deterministic.
+SYNC_REQUEST = dict(
+    TYPICAL_REQUEST,
+    sync_windows=[
+        {"start": 3, "end": 5, "value": 16},
+        {"start": 10, "end": 14, "value": 36},
+    ],
+)
+
+# Anchor/step propagation keeps 39 away from every element in [0,2].
+SYNC_CONFLICT_REQUEST = dict(
+    TYPICAL_REQUEST,
+    sync_windows=[{"start": 0, "end": 2, "value": 39}],
 )
 
 
@@ -181,6 +199,21 @@ def _validate_plan(body):
     assert plan["total_abs_error"] == sum(abs(e) for e in plan["errors"])
 
 
+def _validate_sync(body, request):
+    plan = body["plan"]
+    x = plan["delays"]
+    got = plan.get("sync_windows")
+    assert isinstance(got, list), "plan must list sync window assignments"
+    assert len(got) == len(request["sync_windows"]), "one entry per window"
+    for w, g in zip(request["sync_windows"], got):
+        assert g["value"] == w["value"], "window value echoed in order"
+        assert w["start"] <= g["index"] <= w["end"], "index inside window"
+        assert x[g["index"]] == w["value"], "selected element hits value"
+        hits = sum(1 for i in range(w["start"], w["end"] + 1)
+                   if x[i] == w["value"])
+        assert hits == 1, "exactly one element per window hits the value"
+
+
 def check_api_smoke():
     print("== [3/3] API smoke ==")
     base_url = os.environ.get("API_BASE_URL")
@@ -229,6 +262,39 @@ def check_api_smoke():
         c0 = body["conflicts"][0]
         print(f"   conflict request: PASS (422 {c0['kind']} "
               f"[{c0['start']},{c0['end']}], no partial table)")
+
+        status, body = _request("POST",
+                                f"{base_url}/api/delay-plans/compile",
+                                SYNC_REQUEST)
+        if status != 200:
+            print(f"   sync compile returned {status}: {body}")
+            return False
+        try:
+            _validate_plan(body)
+            _validate_sync(body, SYNC_REQUEST)
+        except AssertionError as e:
+            print(f"   sync plan validation failed: {e}")
+            print(json.dumps(body, indent=2))
+            return False
+        print(f"   sync windows: PASS "
+              f"(assignments {body['plan']['sync_windows']})")
+
+        status, body = _request("POST",
+                                f"{base_url}/api/delay-plans/compile",
+                                SYNC_CONFLICT_REQUEST)
+        if status != 422:
+            print(f"   sync conflict expected 422, got {status}: {body}")
+            return False
+        if "delays" in body or "ramps" in body or "plan" in body:
+            print("   sync infeasible response leaked a partial plan")
+            return False
+        confs = body.get("conflicts") or []
+        if not any(c.get("kind") == "sync_window" and c.get("start") == 0
+                   and c.get("end") == 2 for c in confs):
+            print(f"   sync conflict must report the window range: {body}")
+            return False
+        print("   sync conflict: PASS (422 sync_window [0,2], "
+              "no partial plan)")
         return True
     finally:
         if inproc is not None:
